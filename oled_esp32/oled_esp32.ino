@@ -9,6 +9,7 @@
 #include <Wire.h>
 #include <WiFi.h>
 #include <WiFiUdp.h>
+#include <ESPmDNS.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 
@@ -40,14 +41,12 @@ void drawDisplay(String letter) {
   display.drawLine(0, 10, 127, 10, SSD1306_WHITE);
 
   if (letter == "" || letter == "—") {
-    // waiting state
     display.setTextSize(1);
     display.setCursor(20, 28);
     display.println("Waiting for sign...");
   } else {
-    // big letter in center
     display.setTextSize(4);
-    int x = (SCREEN_WIDTH - 24) / 2;  // center for large char
+    int x = (SCREEN_WIDTH - 24) / 2;
     display.setCursor(x, 16);
     display.println(letter);
   }
@@ -56,7 +55,6 @@ void drawDisplay(String letter) {
   display.drawLine(0, 53, 127, 53, SSD1306_WHITE);
   display.setTextSize(1);
   display.setCursor(0, 56);
-  // show last 16 chars of history
   String hist = letterHistory;
   if (hist.length() > 16) hist = hist.substring(hist.length() - 16);
   display.println(hist);
@@ -104,6 +102,11 @@ void setup() {
 
   Serial.printf("\nConnected! IP: %s\n", WiFi.localIP().toString().c_str());
 
+  // start mDNS
+  if (MDNS.begin("oled-esp32")) {
+    Serial.println("mDNS started — oled-esp32.local");
+  }
+
   display.clearDisplay();
   display.setCursor(0, 0);
   display.println("Connected!");
@@ -120,6 +123,22 @@ void setup() {
 }
 
 void loop() {
+  // ── reconnect if WiFi drops ──
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi lost, reconnecting...");
+    WiFi.reconnect();
+    int attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+      delay(500);
+      attempts++;
+    }
+    if (WiFi.status() == WL_CONNECTED) {
+      udp.begin(UDP_PORT);
+      Serial.println("Reconnected!");
+    }
+    return;
+  }
+
   int packetSize = udp.parsePacket();
   if (packetSize) {
     char buf[32];
@@ -130,7 +149,9 @@ void loop() {
 
     Serial.printf("Received: %s\n", received.c_str());
 
-    if (received == "SPACE") {
+    if (received == "PING") {
+      // keepalive — ignore
+    } else if (received == "SPACE") {
       letterHistory += " ";
       drawDisplay(currentLetter);
     } else if (received == "CLEAR") {
