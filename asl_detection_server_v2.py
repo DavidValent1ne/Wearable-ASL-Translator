@@ -19,15 +19,48 @@ BAUD_RATE    = 115200
 
 # ── UDP to OLED ESP32 ──
 OLED_UDP_PORT  = 4210
-BROADCAST_IP   = '10.0.0.255'
+OLED_HOSTNAME  = 'oled-esp32.local'
 udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
 
+def resolve_oled_ip():
+    try:
+        return socket.gethostbyname(OLED_HOSTNAME)
+    except Exception:
+        return None
+
+def get_broadcast_ip():
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(('8.8.8.8', 80))
+        local_ip = s.getsockname()[0]
+        s.close()
+        parts = local_ip.split('.')
+        parts[3] = '255'
+        return '.'.join(parts)
+    except Exception:
+        return '255.255.255.255'
+
 def send_to_oled(letter):
     try:
-        udp_sock.sendto(letter.encode(), (BROADCAST_IP, OLED_UDP_PORT))
+        ip = resolve_oled_ip()
+        if ip:
+            udp_sock.sendto(letter.encode(), (ip, OLED_UDP_PORT))
+        else:
+            broadcast = get_broadcast_ip()
+            udp_sock.sendto(letter.encode(), (broadcast, OLED_UDP_PORT))
     except Exception as e:
         print("UDP error:", e)
+
+def oled_keepalive_thread():
+    while True:
+        time.sleep(30)
+        try:
+            ip = resolve_oled_ip()
+            if ip:
+                udp_sock.sendto(b'PING', (ip, OLED_UDP_PORT))
+        except Exception:
+            pass
 
 # ── FLEX THRESHOLDS (below = bent) ──
 FLEX_THRESH = {
@@ -74,7 +107,35 @@ def wrist_tilted():
 def hand_tilted():
     return state['tilt']['hand']
 
-# ── J motion detector ──
+# ── PiSugar battery state ──
+battery = {'percent': 0, 'charging': False}
+
+def battery_thread():
+    while True:
+        try:
+            import socket as sock
+            s = sock.socket(sock.AF_INET, sock.SOCK_STREAM)
+            s.settimeout(2)
+            s.connect(('localhost', 8423))
+
+            # get battery percentage
+            s.sendall(b'get battery\n')
+            pct_resp = s.recv(64).decode().strip()
+            # format: "battery: 92.69775"
+            if 'battery:' in pct_resp:
+                battery['percent'] = int(float(pct_resp.split(':')[1].strip()))
+
+            # get charging status
+            s.sendall(b'get battery_charging\n')
+            chg_resp = s.recv(64).decode().strip()
+            # format: "battery_charging: true" or "battery_charging: false"
+            if 'battery_charging:' in chg_resp:
+                battery['charging'] = 'true' in chg_resp.lower()
+
+            s.close()
+        except Exception as e:
+            print("Battery error:", e)
+        time.sleep(30)  # update every 30 seconds
 j_gyro_window = []
 J_WINDOW_SIZE    = 15
 J_PEAK_THRESH    = 250.0
@@ -147,9 +208,11 @@ def get_display_letter():
 last_sent_letter   = '—'
 letter_hold_start  = None
 HOLD_SECONDS       = 0.8
+last_oled_send     = 0.0
+OLED_COOLDOWN      = 1.0
 
 def maybe_send_letter(letter):
-    global last_sent_letter, letter_hold_start, last_detected, last_detected_time
+    global last_sent_letter, letter_hold_start, last_detected, last_detected_time, last_oled_send
     now = time.time()
     if letter != '—':
         last_detected = letter
@@ -158,9 +221,10 @@ def maybe_send_letter(letter):
         if letter_hold_start is None:
             letter_hold_start = now
         elif now - letter_hold_start >= HOLD_SECONDS:
-            send_to_oled(letter)
+            if now - last_oled_send >= OLED_COOLDOWN:
+                send_to_oled(letter)
+                last_oled_send = now
             letter_hold_start = None
-            time.sleep(0.8)
     else:
         letter_hold_start = None
     last_sent_letter = letter
@@ -252,13 +316,13 @@ def detect_letter():
     if t and not i and not m and r and p and ht:
         return 'H'
     # U — index+middle straight, fingers touching (FSR > 1000), no tilt
-    if t and not i and fx['middle'] > 1750 and r and p and state['fsr']['uv'] > 1000 and not ht and not wt:
+    if t and not i and fx['middle'] > 1600 and r and p and state['fsr']['uv'] > 1000 and not ht and not wt:
         return 'U'
     # V — index+middle straight, fingers apart (FSR <= 1000), no tilt
-    if t and not i and fx['middle'] > 1750 and r and p and state['fsr']['uv'] <= 1000 and not ht and not wt:
+    if t and not i and fx['middle'] > 1600 and r and p and state['fsr']['uv'] <= 1000 and not ht and not wt:
         return 'V'
     # R — index straight, middle slightly bent, rest bent, no tilt
-    if t and not i and fx['middle'] > 1350 and fx['middle'] < 1750 and r and p and not ht and not wt:
+    if t and not i and fx['middle'] > 1350 and fx['middle'] <= 1600 and r and p and not ht and not wt:
         return 'R'
     # L — thumb+index straight, rest bent, no touches
     if not t and not i and m and r and p and not ti:
@@ -430,6 +494,12 @@ HTML = """<!DOCTYPE html>
     <span>4095 — fingers touching (U)</span>
   </div>
 </div>
+<div class="battery-bar">
+  <span class="bat-icon" id="bat-icon">🔋</span>
+  <div class="bat-track"><div class="bat-fill" id="bat-fill" style="width:0%"></div></div>
+  <span class="bat-pct" id="bat-pct">--%</span>
+  <span class="bat-status" id="bat-status">--</span>
+</div>
 <div class="oled-status">
   <div class="status-dot"></div>
   Letters also sent to OLED display (hold sign 0.8s to register)
@@ -481,6 +551,15 @@ async function update() {
       const cls=(d.bent[f]?'bent':'')+(touch?' touch':'');
       return `<div class="finger"><div class="finger-seg ${cls}"></div><div class="finger-seg ${cls}"></div><div class="finger-seg ${cls}"></div><div class="finger-name">${f[0].toUpperCase()}</div></div>`;
     }).join('');
+    // battery
+    const pct = d.battery.percent;
+    const batFill = document.getElementById('bat-fill');
+    batFill.style.width = pct + '%';
+    batFill.className = 'bat-fill' + (pct < 20 ? ' low' : pct < 50 ? ' mid' : '');
+    document.getElementById('bat-pct').textContent = pct + '%';
+    document.getElementById('bat-status').textContent = d.battery.charging ? '⚡ Charging' : 'On battery';
+    document.getElementById('bat-icon').textContent = d.battery.charging ? '⚡' : pct < 20 ? '🪫' : '🔋';
+
     // FSR bar
     const fsrVal = d.fsr.uv;
     const fsrPct = Math.min(100, (fsrVal / 4095) * 100);
@@ -517,6 +596,7 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == '/data':
             response = dict(state)
             response['display_letter'] = get_display_letter()
+            response['battery'] = dict(battery)
             self.send_response(200)
             self.send_header('Content-type', 'application/json')
             self.send_header('Access-Control-Allow-Origin', '*')
@@ -532,9 +612,13 @@ class Handler(BaseHTTPRequestHandler):
 if __name__ == '__main__':
     t = threading.Thread(target=uart_thread, daemon=True)
     t.start()
+    b = threading.Thread(target=battery_thread, daemon=True)
+    b.start()
+    k = threading.Thread(target=oled_keepalive_thread, daemon=True)
+    k.start()
     port = 5000
     server = HTTPServer(('0.0.0.0', port), Handler)
     print(f"ASL Dashboard running at http://piglove.local:{port}")
-    print(f"Sending letters to OLED ESP32 via UDP broadcast on {BROADCAST_IP}:{OLED_UDP_PORT}")
+    print(f"Sending letters to OLED ESP32 via UDP broadcast on port {OLED_UDP_PORT}")
     print("Press Ctrl+C to stop")
     server.serve_forever()
